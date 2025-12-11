@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chinese Chess (Xiangqi) — Full Rules</title>
+<style>
+  :root{--size:60px}
+  body{font-family:Inter,Arial,Helvetica,sans-serif;background:#f3f4f6;margin:0;padding:24px;display:flex;justify-content:center}
+  .container{display:flex;gap:20px;max-width:1100px}
+  #left{background:#fdf7e3;padding:18px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.08)}
+  canvas{background:#e7cfa3;border-radius:8px;display:block}
+  #controls{margin-top:12px;display:flex;gap:8px;align-items:center}
+  button{padding:8px 12px;border-radius:6px;border:1px solid #bbb;background:white;cursor:pointer}
+  select{padding:6px;border-radius:6px}
+  #right{width:320px;background:white;padding:16px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}
+  h3{margin-top:0}
+  #pieceInfoBox{font-size:14px;line-height:1.45}
+  .turn{font-weight:700;margin-top:10px}
+  #howToPlayModal{position:fixed;inset:0;background:rgba(0,0,0,0.45);display:none;align-items:center;justify-content:center}
+  #howBox{background:white;padding:18px;border-radius:8px;max-width:720px;max-height:80vh;overflow:auto;position:relative}
+  #howBox button{position:absolute;right:12px;top:12px}
+  .note{font-size:13px;color:#444}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div id="left">
+      <h2>Chinese Chess (Xiangqi)</h2>
+      <canvas id="board" width="600" height="660"></canvas>
+      <div id="controls">
+        <label for="playerColor">Choose your color:</label>
+        <select id="playerColor"><option value="red">Red (top)</option><option value="black">Black (bottom)</option></select>
+        <button id="startHuman">Play vs Human</button>
+        <button id="startComputer">Play vs Computer</button>
+        <button id="showHowToPlay">How to Play</button>
+        <div class="turn" id="turnLabel">Turn: -</div>
+      </div>
+    </div>
+
+    <aside id="right">
+      <h3>Pieces & Movement</h3>
+      <div id="pieceInfoBox"></div>
+      <hr>
+      <div class="note"><strong>Palace:</strong> 3×3 area at columns 3–5. Generals & Advisors must remain inside. <br>
+      <strong>River:</strong> between rows 4 and 5. Elephants cannot cross. Soldiers gain sideways moves after crossing.</div>
+      <div style="margin-top:10px;font-size:14px">
+        <strong>Controls</strong>
+        <div class="note">Click a piece of the side to move — legal destinations are highlighted. Selecting an empty square clears selection.</div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="howToPlayModal">
+    <div id="howBox">
+      <button id="closeHowToPlay">Close</button>
+      <h2>How to Play — Rules implemented</h2>
+      <ul>
+        <li><strong>General</strong>: 1 orthogonal inside palace. Flying general rule implemented.</li>
+        <li><strong>Advisor</strong>: 1 diagonal inside palace.</li>
+        <li><strong>Elephant</strong>: 2 diagonal, cannot cross river, blocked if midpoint occupied.</li>
+        <li><strong>Horse</strong>: 1 orth then 1 diag (L). Blocked if orth adjacent square occupied.</li>
+        <li><strong>Chariot</strong>: moves like rook any distance orthogonally until blocked.</li>
+        <li><strong>Cannon</strong>: moves like chariot when not capturing. To capture it must jump exactly one piece (screen) and land on an opponent piece.</li>
+        <li><strong>Soldier</strong>: 1 forward. After crossing the river can also move 1 sideways. Cannot move backward.</li>
+      </ul>
+      <p>Additional features in this build:</p>
+      <ul>
+        <li>Full legal-move generator for all pieces.</li>
+        <li>Move-highlighting and selected-square highlight.</li>
+        <li>Turn enforcement, check detection (prevent moves that leave your general in check), and simple checkmate/stalemate detection.</li>
+        <li>Play vs computer (random legal moves) or two-player hot-seat.</li>
+      </ul>
+    </div>
+  </div>
+
+<script>
+// --- UI elements ---
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const turnLabel = document.getElementById('turnLabel');
+const startHuman = document.getElementById('startHuman');
+const startComputer = document.getElementById('startComputer');
+const playerColorEl = document.getElementById('playerColor');
+const showHowToPlay = document.getElementById('showHowToPlay');
+const howModal = document.getElementById('howToPlayModal');
+const closeHowToPlay = document.getElementById('closeHowToPlay');
+const pieceInfoBox = document.getElementById('pieceInfoBox');
+
+// --- constants & helpers ---
+const SIZE = 60; // pixels per square
+function inBounds(r,c){return r>=0&&r<10&&c>=0&&c<9}
+function isUpper(s){return s && /[A-Z]/.test(s)}
+function sameSide(a,b){ if(!a||!b) return false; return isUpper(a)===isUpper(b); }
+
+// piece info
+const pieceInfo = {
+  'K':'General — 1 orthogonal inside palace; cannot face opposing general directly without pieces between.',
+  'A':'Advisor — 1 diagonal inside palace only.',
+  'E':'Elephant — 2 diagonal; cannot cross river; blocked if midpoint occupied.',
+  'H':'Horse — L-shape; blocked if the first orthogonal step (leg) occupied.',
+  'R':'Chariot — rook-like (orthogonal unlimited).',
+  'C':'Cannon — rook-like movement; capture by jumping over exactly one piece (the screen).',
+  'P':'Soldier — 1 forward; after crossing river may also move 1 sideways.'
+};
+pieceInfoBox.innerHTML = Object.entries(pieceInfo).map(([k,v])=>`<div><strong>${k}</strong>: ${v}</div>`).join('');
+
+// board state (10 rows x 9 cols). Uppercase = Red (top), lowercase = Black (bottom)
+let board = [];
+let turn = 'red'; // 'red' or 'black'
+let selected = null; // [r,c]
+let vsComputer = false;
+
+function resetBoard(){
+  board = Array.from({length:10},()=>Array(9).fill(''));
+  // red (top, uppercase) initial
+  board[0] = ['R','H','E','A','K','A','E','H','R'];
+  board[2][1] = 'C'; board[2][7] = 'C';
+  board[3] = ['P','','P','','P','','P','','P'];
+  // black (bottom, lowercase)
+  board[9] = ['r','h','e','a','k','a','e','h','r'];
+  board[7][1] = 'c'; board[7][7] = 'c';
+  board[6] = ['p','','p','','p','','p','','p'];
+}
+
+// draw board & pieces
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.font = '18px Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+  // grid squares
+  for(let r=0;r<10;r++){
+    for(let c=0;c<9;c++){
+      ctx.strokeStyle = '#333';
+      ctx.strokeRect(c*SIZE+30, r*SIZE+30, SIZE, SIZE);
+    }
+  }
+
+  // draw pieces
+  for(let r=0;r<10;r++) for(let c=0;c<9;c++){
+    const p = board[r][c];
+    if(!p) continue;
+    ctx.fillStyle = isUpper(p) ? '#c0392b' : '#2c3e50';
+    ctx.beginPath(); ctx.arc(c*SIZE+60, r*SIZE+60, 22, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle='white'; ctx.fillText(p, c*SIZE+60, r*SIZE+60);
+  }
+
+  // highlight selection + legal moves
+  if(selected){
+    const [sr,sc] = selected;
+    // yellow square
+    ctx.strokeStyle = 'gold'; ctx.lineWidth = 4;
+    ctx.strokeRect(sc*SIZE+30+3, sr*SIZE+30+3, SIZE-6, SIZE-6);
+    ctx.lineWidth = 1;
+    // legal moves
+    const moves = generateMoves(sr,sc, true); // true = include only legal (w.r.t check)
+    for(const [r,c] of moves){
+      // green circle for destination
+      ctx.fillStyle = 'rgba(0,200,0,0.35)'; ctx.beginPath(); ctx.arc(c*SIZE+60, r*SIZE+60, 12, 0, Math.PI*2); ctx.fill();
+      // mark captures with hollow ring
+      if(board[r][c]){ ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.beginPath(); ctx.arc(c*SIZE+60,r*SIZE+60,14,0,Math.PI*2); ctx.stroke(); }
+    }
+  }
+}
+
+// helper to clone the board
+function cloneBoard(b){ return b.map(row=>row.slice()); }
+
+// find general position for side
+function findGeneral(clonedBoard, sideUpper){
+  for(let r=0;r<10;r++) for(let c=0;c<9;c++){ const p=clonedBoard[r][c]; if(p && p.toUpperCase()==='K' && isUpper(p)===sideUpper) return [r,c]; }
+  return null;
+}
+
+// check if 'side' ("red"/"black") is in check on given board
+function isInCheck(clonedBoard, side){
+  const sideUpper = (side==='red');
+  const gen = findGeneral(clonedBoard, sideUpper);
+  if(!gen) return false; // no general found (shouldn't happen)
+  const [gr,gc] = gen;
+  // iterate all opponent pieces and see if any generateMoves can capture general (we'll use attack generator that doesn't consider check)
+  for(let r=0;r<10;r++) for(let c=0;c<9;c++){
+    const p = clonedBoard[r][c]; if(!p) continue;
+    if(isUpper(p)===sideUpper) continue; // same side
+    const attacks = generateMovesForCheck(r,c,clonedBoard);
+    for(const [ar,ac] of attacks) if(ar===gr && ac===gc) return true;
+  }
+  return false;
+}
+
+// generate raw attack moves for piece at r,c on provided board (used for check detection). This does NOT filter moves that would leave own general in check.
+function generateMovesForCheck(sr,sc, tempBoard){
+  const piece = tempBoard[sr][sc]; if(!piece) return [];
+  const moves = [];
+  const isRedPiece = isUpper(piece);
+  const dir = isRedPiece ? 1 : -1;
+  const add = (r,c)=>{ if(!inBounds(r,c)) return; const t=tempBoard[r][c]; if(!t || !sameSide(piece,t)) moves.push([r,c]); };
+  const type = piece.toUpperCase();
+  if(type==='K'){
+    const palaceRows = isRedPiece ? [0,1,2] : [7,8,9];
+    [[1,0],[-1,0],[0,1],[0,-1]].forEach(([dr,dc])=>{ const nr=sr+dr,nc=sc+dc; if(palaceRows.includes(nr)&&nc>=3&&nc<=5) add(nr,nc); });
+    // flying general
+    for(let rr=sr+dir; rr>=0 && rr<10; rr+=dir){ const t=tempBoard[rr][sc]; if(t){ if(t.toUpperCase()==='K' && isUpper(t)!==isRedPiece) moves.push([rr,sc]); break; } }
+  } else if(type==='A'){
+    const palaceRows = isRedPiece ? [0,1,2] : [7,8,9];
+    [[1,1],[1,-1],[-1,1],[-1,-1]].forEach(([dr,dc])=>{ const nr=sr+dr,nc=sc+dc; if(palaceRows.includes(nr)&&nc>=3&&nc<=5) add(nr,nc); });
+  } else if(type==='E'){
+    [[2,2],[2,-2],[-2,2],[-2,-2]].forEach(([dr,dc])=>{ const nr=sr+dr,nc=sc+dc; const mr=sr+dr/2, mc=sc+dc/2; if(!inBounds(nr,nc)) return; if(isRedPiece && nr>4) return; if(!isRedPiece && nr<5) return; if(tempBoard[mr][mc]) return; add(nr,nc); });
+  } else if(type==='H'){
+    const horse = [ [1,2,[0,1]],[2,1,[1,0]],[2,-1,[1,0]],[1,-2,[0,-1]],[-1,-2,[0,-1]],[-2,-1,[-1,0]],[-2,1,[-1,0]],[-1,2,[0,1]] ];
+    horse.forEach(([dr,dc,leg])=>{ const lr=sr+leg[0], lc=sc+leg[1]; if(inBounds(sr+dr,sc+dc) && !tempBoard[lr][lc]) add(sr+dr,sc+dc); });
+  } else if(type==='R' || type==='C'){
+    [[1,0],[-1,0],[0,1],[0,-1]].forEach(([dr,dc])=>{
+      let nr=sr+dr, nc=sc+dc;
+      if(type==='R'){
+        while(inBounds(nr,nc)){ if(!tempBoard[nr][nc]){ add(nr,nc); nr+=dr; nc+=dc;} else{ add(nr,nc); break; } }
+      } else {
+        while(inBounds(nr,nc) && !tempBoard[nr][nc]){ add(nr,nc); nr+=dr; nc+=dc; }
+        if(inBounds(nr,nc)){ let sr2=nr+dr, sc2=nc+dc; while(inBounds(sr2,sc2)){ if(tempBoard[sr2][sc2]){ if(!sameSide(tempBoard[sr2][sc2], piece)) moves.push([sr2,sc2]); break; } sr2+=dr; sc2+=dc; } }
+      }
+    });
+  } else if(type==='P'){
+    const fr = sr + dir; if(inBounds(fr,sc)) add(fr,sc);
+    const crossed = isRedPiece ? sr>=5 : sr<=4; if(crossed){ if(inBounds(sr,sc-1)) add(sr,sc-1); if(inBounds(sr,sc+1)) add(sr,sc+1); }
+  }
+  return moves;
+}
+
+// main generator that also enforces that a move cannot leave the mover's general in check
+function generateMoves(sr,sc, enforceCheck=true){
+  const piece = board[sr][sc]; if(!piece) return [];
+  const raw = generateMovesForCheck(sr,sc, board);
+  if(!enforceCheck) return raw;
+  const legal = [];
+  for(const [r,c] of raw){
+    const copy = cloneBoard(board);
+    copy[r][c] = copy[sr][sc]; copy[sr][sc] = '';
+    const moverSide = isUpper(piece) ? 'red' : 'black';
+    if(!isInCheck(copy, moverSide)) legal.push([r,c]);
+  }
+  return legal;
+}
+
+// perform move (assumes legal)
+function makeMove(sr,sc,r,c){
+  const piece = board[sr][sc];
+  board[r][c] = piece; board[sr][sc] = '';
+  // toggle turn
+  turn = (turn==='red') ? 'black' : 'red';
+  updateTurnLabel();
+}
+
+function updateTurnLabel(){ turnLabel.innerText = 'Turn: ' + turn.toUpperCase(); }
+
+// click handling
+canvas.addEventListener('click', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left; const y = e.clientY - rect.top;
+  const c = Math.floor((x-30)/SIZE); const r = Math.floor((y-30)/SIZE);
+  if(!inBounds(r,c)) return;
+
+  const clicked = board[r][c];
+  if(selected){
+    const [sr,sc] = selected;
+    const moves = generateMoves(sr,sc,true);
+    if(moves.find(m=>m[0]===r&&m[1]===c)){
+      makeMove(sr,sc,r,c);
+      selected = null; draw();
+      // check for checkmate or stalemate
+      setTimeout(()=>{ postMoveAIIfNeeded(); checkGameEnd(); }, 120);
+      return;
+    } else {
+      // if clicked own piece of current turn, reselect
+      if(clicked && isUpper(clicked) === (turn==='red')){ selected=[r,c]; draw(); return; }
+      selected = null; draw(); return;
+    }
+  }
+
+  if(clicked){
+    // only allow selecting pieces of the side to move
+    if(isUpper(clicked) !== (turn==='red')) return;
+    selected=[r,c]; draw();
+  }
+});
+
+// simple computer: random legal move
+function makeComputerMove(){
+  const side = turn; const sideUpper = (side==='red');
+  const all = [];
+  for(let r=0;r<10;r++) for(let c=0;c<9;c++){ const p=board[r][c]; if(p && isUpper(p)===sideUpper){ const m=generateMoves(r,c,true); for(const mv of m) all.push({from:[r,c],to:mv}); } }
+  if(all.length===0) return;
+  const choice = all[Math.floor(Math.random()*all.length)];
+  makeMove(choice.from[0],choice.from[1], choice.to[0], choice.to[1]); draw();
+}
+
+function postMoveAIIfNeeded(){ if(vsComputer && ((turn!==(playerColorEl.value)))){ setTimeout(()=>{ makeComputerMove(); checkGameEnd(); }, 250); }}
+
+// check for game end (checkmate or stalemate)
+function checkGameEnd(){
+  // does current side have any legal move? if not, and is in check -> checkmate, else stalemate
+  const side = turn; const sideUpper = (side==='red');
+  let any=false;
+  for(let r=0;r<10;r++) for(let c=0;c<9;c++){ const p=board[r][c]; if(p && isUpper(p)===sideUpper){ const m=generateMoves(r,c,true); if(m.length>0) any=true; } }
+  if(!any){
+    if(isInCheck(board, side)){
+      alert((side==='red'?'Red':'Black') + ' is checkmated. ' + (side==='red'?'Black':'Red') + ' wins!');
+    } else {
+      alert('Stalemate — no legal moves.');
+    }
+    // stop game by resetting vsComputer false so computer won't move
+    vsComputer=false; return true;
+  }
+  return false;
+}
+
+// UI buttons
+startHuman.addEventListener('click', ()=>{
+  vsComputer=false; resetBoard(); turn='red'; selected=null; updateTurnLabel(); draw();
+});
+startComputer.addEventListener('click', ()=>{
+  vsComputer=true; resetBoard(); turn='red'; selected=null; updateTurnLabel(); draw();
+  // if player chose black, computer moves first
+  if(playerColorEl.value==='black'){ setTimeout(()=>{ makeComputerMove(); }, 300); }
+});
+showHowToPlay.addEventListener('click', ()=>{ howModal.style.display='flex'; });
+closeHowToPlay.addEventListener('click', ()=>{ howModal.style.display='none'; });
+
+// initialize
+resetBoard(); updateTurnLabel(); draw();
+</script>
+</body>
+</html>
